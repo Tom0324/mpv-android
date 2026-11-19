@@ -1,0 +1,86 @@
+﻿name: Build AVC-fixed mpv AAR (mpvEx JNI)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf pkgconf libtool ninja-build python3-pip gperf nasm
+          sudo pip3 install meson --break-system-packages
+
+      - name: Pin mpv to v0.42.0 and apply AVC PTS patch
+        run: |
+          set -e
+          # pin mpv tarball to v0.42.0 (matches v8)
+          sed -i 's#https://github.com/mpv-player/mpv/archive/master.tar.gz#https://github.com/mpv-player/mpv/archive/refs/tags/v0.42.0.tar.gz#' buildscripts/include/ci.sh
+          grep -n 'mpv-player/mpv/archive' buildscripts/include/ci.sh
+          # create patch script
+          cat > /tmp/fix_avc.py <<'PY'
+          path = 'deps/mpv/player/video.c'
+          import os
+          if not os.path.exists(path):
+              raise SystemExit('video.c missing: ' + path)
+          src = open(path, encoding='utf-8').read()
+          if 'PATCH: hwdec H.264' in src:
+              print('already patched'); raise SystemExit(0)
+          old = "            frame_time = 0;\n"
+          w = src.index('Invalid video timestamp')
+          pos = src.index(old, w)
+          new = """                    /* PATCH: hwdec H.264 with B-frames emits non-monotonic
+                     * decode-order PTS. Zeroing frame_time breaks adjust_sync
+                     * and causes gradual A/V drift. Synthesize a monotonic PTS
+                     * from container fps and keep a plausible frame_time. */
+                    if (frame_time <= 0) {
+                        float fps = 0;
+                        if (mpctx->vo_chain && mpctx->vo_chain->filter)
+                            fps = mpctx->vo_chain->filter->container_fps;
+                        double est = (fps > 0 && fps < 1000) ? 1.0 / fps : 0;
+                        if (est > 0) {
+                            pts = mpctx->video_pts + est;
+                            frame_time = est;
+                            mpctx->next_frames[0]->pts = pts;
+                        } else {
+                            frame_time = 0;
+                        }
+                    } else {
+                        frame_time = 0;
+                    }
+          """
+          open(path,'w',encoding='utf-8',newline='\n').write(src[:pos]+new+src[pos+len(old):])
+          print('patched', path)
+          PY
+
+      - name: Fetch deps (install) then patch, then build
+        run: |
+          set -e
+          buildscripts/include/ci.sh install
+          python3 /tmp/fix_avc.py
+          grep -n 'PATCH: hwdec H.264' deps/mpv/player/video.c
+          cd buildscripts
+          ./download.sh > /dev/null
+          ./buildall.sh --arch arm64 mpv
+          ./buildall.sh -n
+
+      - name: Upload AAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: mpv-avcfix-aar
+          path: app/build/outputs/aar/app-release.aar
+          if-no-files-found: error
+          retention-days: 30
