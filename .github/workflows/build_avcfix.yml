@@ -66,14 +66,18 @@ jobs:
           print('patched', path)
           PY
 
-      - name: Fetch deps (install) then patch, then build
+      - name: Fetch deps, download mpv source, patch, then build
         run: |
           set -e
           buildscripts/include/ci.sh install
-          python3 /tmp/fix_avc.py
-          grep -n 'PATCH: hwdec H.264' deps/mpv/player/video.c
           cd buildscripts
           ./download.sh > /dev/null
+          cd ..
+          # mpv source lives under buildscripts/deps/mpv after download.sh
+          sed -i "s#path = 'deps/mpv/player/video.c'#path = 'buildscripts/deps/mpv/player/video.c'#" /tmp/fix_avc.py
+          python3 /tmp/fix_avc.py
+          grep -n 'PATCH: hwdec H.264' buildscripts/deps/mpv/player/video.c
+          cd buildscripts
           ./buildall.sh --arch arm64 mpv
           ./buildall.sh -n
 
